@@ -1,0 +1,27 @@
+# Streamlit config for the local voice-agent demo.
+
+[server]
+# Mic recordings are uploaded as files. The default cap is small enough that a
+# longer clip fails with a generic "An error has occurred" from st.audio_input.
+maxUploadSize = 1024
+
+# A fixed secret keeps the XSRF cookie valid across restarts and across the
+# different localhost ports Streamlit picks. A random per-boot secret makes the
+# shared localhost cookie collide and the mic upload fail.
+cookieSecret = "grok-voice-support-demo-local-secret-2026"
+
+# The recording is posted through an XSRF-protected upload. On localhost across
+# several ports that check can reject it. Safe to disable for a local demo.
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
+
+# Pin the light theme so widgets do not inherit OS dark mode and render dark
+# chat bubbles and audio players over a light page.
+[theme]
+base = "light"
+primaryColor = "#03EF62"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7F9"
+textColor = "#05192D"

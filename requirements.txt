@@ -1,0 +1,15 @@
+# Core: the realtime client and the terminal scripts.
+websockets==16.0
+python-dotenv==1.2.2
+
+# token_server.py: the ephemeral-token endpoint.
+fastapi==0.136.3
+uvicorn==0.47.0
+httpx==0.28.1
+
+# app_streamlit.py: the live browser demo.
+streamlit==1.57.0
+streamlit-webrtc==0.76.3
+av==17.1.0
+aiortc==1.15.0
+numpy==2.4.5

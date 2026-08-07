@@ -1,0 +1,24 @@
+# Secrets. The API key lives here and must never be committed.
+.env
+.env.local
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local runtime noise
+*.log
+.streamlit/secrets.toml
+debug_*.wav
+response.wav
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
