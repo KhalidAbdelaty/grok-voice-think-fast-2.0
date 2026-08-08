@@ -25,6 +25,12 @@ from voice_client import VoiceClient
 # 100 ms of 24 kHz mono PCM16 per append.
 CHUNK_BYTES = 4800
 
+# Mic frames queue up as ~20 ms items (the aiortc default ptime). Capping the
+# queue bounds how far behind real time a slow network can push the caller's
+# audio; past this, drop the oldest buffered chunk rather than let latency
+# grow without limit, since a stale frame is worse than a missing one.
+MAX_QUEUED_MIC_CHUNKS = 250  # ~5 s of audio
+
 # Event types that arrive hundreds of times per turn. Counting them beats
 # listing them: an event panel with 400 identical rows tells you nothing.
 NOISY_EVENTS = {
@@ -71,6 +77,13 @@ class LiveCall:
         self._handoff = None
         self._speaking = False
         self._thinking = False
+        # response.done means the server finished *generating* audio, not
+        # that the browser finished *playing* it: PcmAudioSource holds a FIFO
+        # that can be seconds deep. This tracks the perf_counter() deadline
+        # by which everything pushed so far will have finished playing, so
+        # barge-in detection and the echo gate key off actual audible
+        # playback instead of the server's generation state.
+        self._playback_until = 0.0
         self._reply_started = None
         self._last_reply_latency = None
         # Input transcription arrives in pieces: "updated" carries the
@@ -118,7 +131,7 @@ class LiveCall:
                 pass
 
     async def _main(self):
-        self._send_queue = asyncio.Queue()
+        self._send_queue = asyncio.Queue(maxsize=MAX_QUEUED_MIC_CHUNKS)
         await self._client.connect()
         await self._client.configure_session(self.session_config)
         sender = asyncio.create_task(self._sender())
@@ -165,12 +178,18 @@ class LiveCall:
                 # Only an interruption if something was playing. The server
                 # fires this whenever it hears speech, including when the
                 # caller simply takes their turn, and labelling all of those
-                # as interruptions buries the real ones.
+                # as interruptions buries the real ones. "Playing" has to
+                # mean audible in the browser, not just still generating:
+                # response.done can land seconds before PcmAudioSource's FIFO
+                # actually empties, so this checks the playback deadline too,
+                # not only the raw streaming flag.
                 with self._lock:
-                    was_speaking = self._speaking
+                    now = time.perf_counter()
+                    was_playing = self._is_playing_locked(now)
                     self._speaking = False
                     self._thinking = False
-                if was_speaking:
+                    self._playback_until = now
+                if was_playing:
                     self.on_barge_in()
                     self._note("system", "Caller interrupted. Playback flushed.")
 
@@ -182,10 +201,16 @@ class LiveCall:
                     self._reply_started = time.perf_counter()
 
             elif etype == "response.output_audio.delta":
+                pcm = base64.b64decode(event["delta"])
                 with self._lock:
                     self._speaking = True
                     self._thinking = False
-                self.on_output_pcm(base64.b64decode(event["delta"]))
+                    now = time.perf_counter()
+                    # Extend the playback deadline by this chunk's duration,
+                    # queuing after whatever is already queued rather than
+                    # from "now" so back-to-back deltas add up correctly.
+                    self._playback_until = max(self._playback_until, now) + pcm_seconds(pcm)
+                self.on_output_pcm(pcm)
 
             elif etype == "response.output_audio_transcript.done":
                 self._note("agent", event.get("transcript", ""))
@@ -207,12 +232,33 @@ class LiveCall:
                         self._last_reply_latency = time.perf_counter() - self._reply_started
                         self._reply_started = None
                 if self._had_function_call(event):
-                    # The tool results are in. Ask for the spoken follow-up.
+                    # The tool results are in. Wait for whatever audio is
+                    # already queued to finish playing before asking for the
+                    # spoken follow-up, or the two responses' audio overlaps
+                    # in the browser.
+                    await self._wait_for_playback_drain()
                     self._count_event("client", "response.create")
                     await self._client.request_response()
 
             elif etype == "error":
                 self._record_error(event.get("error", {}).get("message", "unknown error"))
+
+    def _is_playing_locked(self, now: float | None = None) -> bool:
+        """Whether the browser is still expected to be audibly playing agent
+        speech: either the server is actively streaming deltas right now, or
+        there is buffered audio queued for playback that has not finished.
+        Caller must already hold ``self._lock``.
+        """
+        if now is None:
+            now = time.perf_counter()
+        return self._speaking or now < self._playback_until
+
+    async def _wait_for_playback_drain(self):
+        """Sleep out whatever audio is still queued for browser playback."""
+        with self._lock:
+            remaining = self._playback_until - time.perf_counter()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
     async def _handle_tool_call(self, event):
         name = event["name"]
@@ -250,13 +296,14 @@ class LiveCall:
         return self._thread is not None and self._thread.is_alive()
 
     def is_speaking(self) -> bool:
-        """Whether the agent is producing audio right now.
+        """Whether the agent's speech is still audible right now: streaming,
+        or buffered audio queued for playback that has not finished yet.
 
         Read from the media callback on every frame, so it takes the lock
         briefly rather than building a whole snapshot.
         """
         with self._lock:
-            return self._speaking
+            return self._is_playing_locked()
 
     # ------------------------------------------------------------------
     # Input from Streamlit / the WebRTC thread
@@ -266,7 +313,23 @@ class LiveCall:
         """Queue microphone audio. Safe to call from the aiortc thread."""
         if not pcm or self._loop is None or self._stopped.is_set():
             return
-        self._loop.call_soon_threadsafe(self._send_queue.put_nowait, pcm)
+        self._loop.call_soon_threadsafe(self._enqueue_mic_audio, pcm)
+
+    def _enqueue_mic_audio(self, pcm: bytes):
+        """Runs on the call's own loop. Drops the oldest buffered chunk
+        instead of growing latency without bound when the network, or the
+        sender, falls behind real time."""
+        try:
+            self._send_queue.put_nowait(pcm)
+        except asyncio.QueueFull:
+            try:
+                self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._send_queue.put_nowait(pcm)
+            except asyncio.QueueFull:
+                pass
 
     def send_text(self, text: str):
         """Type a turn instead of speaking it, for when there is no mic."""
@@ -373,7 +436,7 @@ class LiveCall:
                 "conversation_id": self._conversation_id,
                 "error": self._error,
                 "handoff": self._handoff,
-                "speaking": self._speaking,
+                "speaking": self._is_playing_locked(),
                 "thinking": self._thinking,
                 "reply_latency": self._last_reply_latency,
                 "audio_seconds": cost.audio_seconds,

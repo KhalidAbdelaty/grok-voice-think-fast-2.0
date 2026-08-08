@@ -8,6 +8,8 @@ Run: python test_app_state.py
 """
 from __future__ import annotations
 
+import av
+import numpy as np
 from streamlit.testing.v1 import AppTest
 
 failures: list[str] = []
@@ -82,6 +84,10 @@ check("the meter lights up with input level",
       listening.count('class="on"') > 0, listening.count('class="on"'))
 check("a silent mic leaves the meter dark",
       render_state(True, False, False, 0.0).count('class="on"') == 0)
+check("a silent mic leaves the meter dark even while the agent speaks",
+      speaking.count('class="hot"') == 0, speaking.count('class="hot"'))
+check("real mic input while the agent speaks still lights the meter",
+      render_state(True, True, False, 0.6).count('class="hot"') > 0)
 
 print("\nEcho controls:")
 sliders = {s.label: s for s in at.slider}
@@ -102,16 +108,57 @@ check("the gate reaches the mic callback",
       app_streamlit._BOX["echo_gate"])
 
 
-def gated(level, speaking, gate=0.12, half=False):
-    """Would a frame at this level be dropped before reaching the socket?"""
-    return speaking and (half or level < gate)
+class _StubCall:
+    """A LiveCall stand-in for driving the real _on_mic_frame() callback
+    without a socket, so the gating logic under test is the logic that
+    actually ships, not a hand-rolled reimplementation of it."""
+
+    def __init__(self, speaking: bool):
+        self._speaking = speaking
+        self.sent: list[bytes] = []
+
+    def is_speaking(self) -> bool:
+        return self._speaking
+
+    def send_audio(self, pcm: bytes) -> None:
+        self.sent.append(pcm)
 
 
-check("speaker bleed is dropped while the agent talks", gated(0.04, speaking=True))
-check("a real interruption still gets through", not gated(0.35, speaking=True))
-check("nothing is dropped while the agent is quiet", not gated(0.04, speaking=False))
-check("half duplex drops everything while the agent talks",
-      gated(0.9, speaking=True, half=True))
+def _tone_frame(level: float, n: int = 480, rate: int = 24000) -> av.AudioFrame:
+    samples = np.full((1, n), int(level * 32767), dtype=np.int16)
+    frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
+    frame.sample_rate = rate
+    return frame
+
+
+def feed(level: float, speaking: bool, gate: float = 0.05, half: bool = False) -> list[bytes]:
+    """Push one synthetic mic frame through the real _on_mic_frame() and
+    report what actually reached the (stubbed) socket."""
+    stub = _StubCall(speaking)
+    with app_streamlit._BOX_LOCK:
+        app_streamlit._BOX["call"] = stub
+        app_streamlit._BOX["resampler"] = av.AudioResampler(
+            format="s16", layout="mono", rate=24000
+        )
+        app_streamlit._BOX["echo_gate"] = gate
+        app_streamlit._BOX["half_duplex"] = half
+    try:
+        app_streamlit._on_mic_frame(_tone_frame(level))
+    finally:
+        with app_streamlit._BOX_LOCK:
+            app_streamlit._BOX["call"] = None
+            app_streamlit._BOX["resampler"] = None
+    return stub.sent
+
+
+check("speaker bleed is dropped while the agent talks, through the real callback",
+      feed(0.02, speaking=True) == [])
+check("a real interruption still gets through the real callback",
+      len(feed(0.3, speaking=True)) > 0)
+check("nothing is dropped while the agent is quiet, through the real callback",
+      len(feed(0.02, speaking=False)) > 0)
+check("half duplex drops everything while the agent talks, through the real callback",
+      feed(0.4, speaking=True, half=True) == [])
 
 print("\nSidebar can be reopened:")
 from ui_theme import CSS  # noqa: E402
