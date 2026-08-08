@@ -9,15 +9,26 @@ import json
 
 import websockets
 
-from config import REALTIME_URL, REALTIME_URL_BASE, SAMPLE_RATE, XAI_API_KEY
+from config import (
+    REALTIME_URL,
+    REALTIME_URL_BASE,
+    SAMPLE_RATE,
+    XAI_API_KEY,
+    audio_rate_per_minute,
+)
 
 
 class CostTracker:
     """Tracks the two billing meters: audio minutes and text-input events."""
 
-    def __init__(self):
+    def __init__(self, model: str | None = None):
         self.audio_seconds = 0.0
         self.text_events = 0
+        # Requested up front, then corrected once the server confirms which
+        # model actually ran the session (see VoiceClient.events()) - an
+        # unrecognized alias can fall back silently, and the two models bill
+        # audio at different rates.
+        self.model = model
 
     def add_audio_bytes(self, num_bytes: int, sample_rate: int = SAMPLE_RATE):
         # 16-bit mono PCM: 2 bytes per sample.
@@ -25,7 +36,7 @@ class CostTracker:
 
     @property
     def audio_usd(self) -> float:
-        return self.audio_seconds / 60 * 0.08  # grok-voice-think-fast-2.0 rate
+        return self.audio_seconds / 60 * audio_rate_per_minute(self.model)
 
     @property
     def text_usd(self) -> float:
@@ -41,7 +52,7 @@ class VoiceClient:
         self.ws = None
         self.conversation_id = resume_conversation_id
         self.model = model
-        self.cost = CostTracker()
+        self.cost = CostTracker(model=model)
 
     async def connect(self, resumption: bool = False):
         if not XAI_API_KEY:
@@ -115,6 +126,12 @@ class VoiceClient:
             event = json.loads(message)
             if event["type"] == "conversation.created":
                 self.conversation_id = event["conversation"]["id"]
+            if event["type"] == "session.created":
+                # An unrecognized model string falls back silently server
+                # side, so bill against what it actually gave us back.
+                actual_model = event.get("session", {}).get("model")
+                if actual_model:
+                    self.cost.model = actual_model
             if event["type"] == "response.output_audio.delta":
                 self.cost.add_audio_bytes(len(base64.b64decode(event["delta"])))
             yield event

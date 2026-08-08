@@ -19,3 +19,19 @@ CLIENT_SECRETS_URL = "https://api.x.ai/v1/realtime/client_secrets"
 
 SAMPLE_RATE = 24000  # Hz, the documented default for audio/pcm
 VOICE = "eve"
+
+# Audio bills per minute, and the rate depends on which model actually ran
+# the session. Keyed by the model string the server reports back in
+# session.created, which is what should be billed against - not necessarily
+# the alias or version string that was requested.
+AUDIO_RATE_PER_MINUTE = {
+    "grok-voice-think-fast-2.0": 0.08,
+    "grok-voice-think-fast-1.0": 0.05,
+}
+DEFAULT_AUDIO_RATE_PER_MINUTE = AUDIO_RATE_PER_MINUTE[MODEL]
+
+
+def audio_rate_per_minute(model: str | None) -> float:
+    """USD per minute of audio for a given model string, falling back to the
+    pinned default for an alias or an unrecognized/not-yet-known model."""
+    return AUDIO_RATE_PER_MINUTE.get(model, DEFAULT_AUDIO_RATE_PER_MINUTE)

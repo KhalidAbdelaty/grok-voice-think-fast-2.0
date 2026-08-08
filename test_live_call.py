@@ -24,6 +24,11 @@ SAMPLE_RATE = 24000
 PCM_100MS = b"\x10\x00" * 2400
 sessions_opened = 0
 sessions_closed = 0
+# Wall-clock markers the fake server drops for the client-timing tests below.
+# A plain module-level dict is enough: fake_server runs on the asyncio loop
+# thread and run_checks() polls it from a worker thread, same pattern as
+# sessions_opened/sessions_closed above.
+event_times: dict = {}
 
 
 async def fake_server(ws):
@@ -39,6 +44,10 @@ async def fake_server(ws):
     await ws.send(json.dumps({"type": "conversation.created",
                               "conversation": {"id": "conv_fake_123"}}))
     command = None
+    # Which flow (if any) is waiting for a clean, no-function-call follow-up
+    # response.create - so the second round-trip of a tool turn ends the
+    # turn instead of reporting another function_call and recursing forever.
+    pending_followup: str | None = None
     try:
         async for raw in ws:
             event = json.loads(raw)
@@ -54,7 +63,60 @@ async def fake_server(ws):
                     command = content.strip()
 
             elif etype == "response.create":
-                if command == "BARGE_IN":
+                if pending_followup == "tool_once":
+                    # The client waited out the queued playback and is now
+                    # asking for the spoken follow-up to the earlier tool
+                    # call. Record when that happened and end the turn
+                    # cleanly instead of handing out another tool call.
+                    pending_followup = None
+                    event_times["followup_request_at"] = time.monotonic()
+                    await ws.send(json.dumps({"type": "response.done",
+                                              "response": {"output": []}}))
+                elif pending_followup == "default_tool":
+                    # Same idea for the default tool-turn scenario below: its
+                    # response.done also reports a function_call, so without
+                    # this the client's follow-up request.create would loop
+                    # back into that same branch forever in the background.
+                    pending_followup = None
+                    await ws.send(json.dumps({"type": "response.done",
+                                              "response": {"output": []}}))
+                elif command == "TOOL_ONCE":
+                    # A tool call whose audio takes real time to play out in
+                    # the browser. The client must not ask for the spoken
+                    # follow-up until that time has passed, or the two
+                    # responses' audio overlaps.
+                    await ws.send(json.dumps({"type": "response.created"}))
+                    await ws.send(json.dumps({
+                        "type": "response.function_call_arguments.done",
+                        "name": "check_order_status", "call_id": "call_drain",
+                        "arguments": json.dumps({"order_number": "ORD-1042"}),
+                    }))
+                    for _ in range(3):  # 300 ms of audio queued for playback
+                        await ws.send(json.dumps({
+                            "type": "response.output_audio.delta",
+                            "delta": base64.b64encode(PCM_100MS).decode(),
+                        }))
+                    await ws.send(json.dumps({
+                        "type": "response.done",
+                        "response": {"output": [{"type": "function_call"}]},
+                    }))
+                    event_times["tool_done_at"] = time.monotonic()
+                    pending_followup = "tool_once"
+                elif command == "BARGE_IN_AFTER_DONE":
+                    # Audio finishes generating (response.done) well before
+                    # it finishes playing in the browser. A barge-in that
+                    # arrives in that gap must still flush playback.
+                    await ws.send(json.dumps({"type": "response.created"}))
+                    for _ in range(3):  # 300 ms of audio queued for playback
+                        await ws.send(json.dumps({
+                            "type": "response.output_audio.delta",
+                            "delta": base64.b64encode(PCM_100MS).decode(),
+                        }))
+                    await ws.send(json.dumps({"type": "response.done",
+                                              "response": {"output": []}}))
+                    await asyncio.sleep(0.05)  # still mid-playback client-side
+                    await ws.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
+                elif command == "BARGE_IN":
                     # Start speaking, then have the caller cut in mid-flow.
                     await ws.send(json.dumps({"type": "response.created"}))
                     for _ in range(3):
@@ -118,6 +180,7 @@ async def fake_server(ws):
                         "type": "response.done",
                         "response": {"output": [{"type": "function_call"}]},
                     }))
+                    pending_followup = "default_tool"
                 command = None
     except websockets.ConnectionClosed:
         pass
@@ -192,6 +255,30 @@ def run_checks():
     check("the line says it was an interruption",
           system_lines and "interrupted" in system_lines[0]["text"].lower(),
           system_lines)
+
+    print("\nBarge-in after response.done, while audio is still buffered:")
+    # response.done only means the server finished generating; the browser's
+    # PcmAudioSource can still have real audio queued. A speech_started that
+    # lands in that gap must still flush playback (regression: _speaking used
+    # to flip False on response.done, which made a barge-in landing here a
+    # silent no-op while stale agent audio kept playing over the caller).
+    before_flushes = len(barge_ins)
+    call.send_text("BARGE_IN_AFTER_DONE")
+    check("playback was still flushed",
+          wait_for(lambda: len(barge_ins) > before_flushes), barge_ins)
+
+    print("\nTool continuation waits for queued playback to drain:")
+    # Regression: the client used to fire the follow-up response.create the
+    # instant response.done arrived, without waiting for the ~300 ms of
+    # audio it had just queued to actually finish playing - so the follow-up
+    # response's audio could start overlapping the tool-call response's tail.
+    event_times.clear()
+    call.send_text("TOOL_ONCE")
+    check("the follow-up request was sent",
+          wait_for(lambda: "followup_request_at" in event_times), event_times)
+    gap = event_times.get("followup_request_at", 0) - event_times.get("tool_done_at", 0)
+    check("the client waited for the queued audio to finish before continuing",
+          gap >= 0.25, f"{gap:.3f}s gap, expected >= ~0.3s")
 
     print("\nA sentence chopped by voice activity detection:")
     call.send_text("FRAGMENTS")

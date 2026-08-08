@@ -221,7 +221,11 @@ def render_state(playing: bool, speaking: bool, thinking: bool, level: float) ->
         # out instead of leaving every bar dark until someone shouts.
         lit = playing and (level ** 0.5) > (i + 1) / 14
         height = 5 + i
-        klass = "hot" if speaking else ("on" if lit else "")
+        # Only color a bar "hot" if the mic level actually lit it. Marking
+        # every bar hot just because the agent is speaking made the meter
+        # look maxed out even with a silent room, which hid whether a
+        # barge-in was actually reaching the callback.
+        klass = "hot" if (speaking and lit) else ("on" if lit else "")
         bars.append(f'<i class="{klass}" style="height:{height}px"></i>')
 
     return (

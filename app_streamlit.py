@@ -15,6 +15,7 @@ Run with:  streamlit run app_streamlit.py
 """
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
@@ -64,6 +65,8 @@ if sys.platform == "win32":
         _ProactorBasePipeTransport._call_connection_lost
     )
 
+_LOGGER = logging.getLogger(__name__)
+
 MODELS = {
     MODEL: "Versioned string. Pin this in anything you deploy.",
     "grok-voice-latest": "Alias. Moves to a new model on SpaceXAI's schedule, not yours.",
@@ -112,6 +115,8 @@ _BOX: dict = {
     "echo_gate": 0.0,   # ignore mic audio below this while the agent speaks
     "half_duplex": False,  # or ignore it entirely, trading away barge-in
     "gated": 0,         # frames suppressed, so the page can show it working
+    "mic_errors": 0,       # frames that raised, so a silent mic isn't silent-silent
+    "last_mic_error": None,
 }
 
 st.set_page_config(page_title="Order Support Voice Agent", page_icon="🎧", layout="wide")
@@ -157,8 +162,14 @@ def _on_mic_frame(frame: av.AudioFrame):
             with _BOX_LOCK:
                 _BOX["level"] = level
             call.send_audio(samples.astype(np.int16).tobytes())
-    except Exception:  # noqa: BLE001 - never kill the media loop over one frame
-        pass
+    except Exception as exc:  # noqa: BLE001 - never kill the media loop over one frame
+        # A silent `pass` here used to mean a resampling or threading fault
+        # could stop the mic dead with nothing in the log and nothing on the
+        # page. Log it and count it so it is at least visible.
+        _LOGGER.exception("mic frame processing failed")
+        with _BOX_LOCK:
+            _BOX["mic_errors"] += 1
+            _BOX["last_mic_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def _init_state():
@@ -175,6 +186,11 @@ def _init_state():
         "tools_history": [],
         "spent_audio_seconds": 0.0,
         "spent_text_events": 0,
+        # Dollars, accumulated per call at that call's own model rate. Not
+        # re-derived from spent_audio_seconds at a single fixed rate, since a
+        # session can mix calls across models that bill audio differently.
+        "spent_audio_usd": 0.0,
+        "spent_text_usd": 0.0,
         "last_model_seen": None,
     }
     for key, value in defaults.items():
@@ -189,12 +205,32 @@ def _archive(call: LiveCall):
     st.session_state.tools_history.extend(snap["tool_calls"])
     st.session_state.spent_audio_seconds += snap["audio_seconds"]
     st.session_state.spent_text_events += snap["text_events"]
+    st.session_state.spent_audio_usd += snap["audio_usd"]
+    st.session_state.spent_text_usd += snap["text_usd"]
     if snap["session_model"]:
         st.session_state.last_model_seen = snap["session_model"]
     if st.session_state.history:
         st.session_state.history.append(
             {"role": "system", "text": "Call ended. Start again to keep the same conversation."}
         )
+
+
+def _teardown_call(call: LiveCall, agent_voice):
+    """Archive and close a call, and drop every reference to it.
+
+    Shared by the normal STOP path and the polling loop's `finally` below, so
+    a call gets cleaned up the same way whether it ends because the caller
+    pressed STOP, the socket errored out, or the worker thread died on its
+    own - instead of only the first of those actually closing the socket and
+    freeing the session against the team's concurrency cap.
+    """
+    _archive(call)
+    call.stop()
+    agent_voice.clear()
+    with _BOX_LOCK:
+        _BOX["call"] = None
+        _BOX["resampler"] = None
+    st.session_state._call = None
 
 
 def _track_changes():
@@ -235,8 +271,12 @@ with st.sidebar:
             help="Server VAD. Too short cuts callers off mid-thought, too long feels sluggish.",
         )
         threshold = st.slider(
-            "Speech threshold", 0.1, 0.9, 0.85, 0.05,
-            help="How loud audio has to be to count as speech. Lower it in a quiet room.",
+            "Speech threshold", 0.1, 0.9, 0.5, 0.05,
+            help="How loud audio has to be to count as speech. The server VAD "
+                 "needs louder audio to trigger as this goes up, so a high "
+                 "value here can make barge-in miss normal-volume speech, "
+                 "especially with automatic gain control off. Lower it in a "
+                 "quiet room, or if interruptions are not registering.",
         )
 
     with st.expander("Echo control", expanded=not st.session_state.history):
@@ -247,11 +287,19 @@ with st.sidebar:
             help="Ends the echo completely, and gives up barge-in while it is on.",
         )
         echo_gate = st.slider(
-            "Echo gate", 0.0, 0.5, 0.12, 0.01, disabled=half_duplex,
+            "Echo gate", 0.0, 0.5, 0.05, 0.01, disabled=half_duplex,
             help="While the agent speaks, ignore mic audio quieter than this. "
                  "Raise it if the agent keeps cutting itself off, lower it if "
-                 "your interruptions are being missed. 0 turns the gate off.",
+                 "your interruptions are being missed. 0 turns the gate off. "
+                 "With automatic gain control disabled, normal speech can "
+                 "measure quieter than you'd expect, so this starts low; "
+                 "prefer headphones over raising it if echo is still a problem.",
         )
+        if _BOX["mic_errors"]:
+            st.warning(
+                f"The microphone callback has failed {_BOX['mic_errors']} time(s). "
+                f"Last error: {_BOX['last_mic_error']}"
+            )
 
     with st.expander("Voice and language"):
         language_label = st.selectbox("Language hint", list(LANGUAGES))
@@ -275,6 +323,8 @@ with st.sidebar:
         st.session_state.tools_history = []
         st.session_state.spent_audio_seconds = 0.0
         st.session_state.spent_text_events = 0
+        st.session_state.spent_audio_usd = 0.0
+        st.session_state.spent_text_usd = 0.0
         st.session_state.conversation_id = None
         st.toast("Order store, transcript and totals cleared.")
 
@@ -381,13 +431,7 @@ with left:
                 call = None
 
     if not playing and call is not None:
-        _archive(call)
-        call.stop()
-        agent_voice.clear()
-        with _BOX_LOCK:
-            _BOX["call"] = None
-            _BOX["resampler"] = None
-        st.session_state._call = None
+        _teardown_call(call, agent_voice)
         call = None
 
     if st.session_state.last_error:
@@ -491,8 +535,12 @@ def paint(snap: dict | None):
     # object that is gone.
     audio_seconds = st.session_state.spent_audio_seconds + (snap["audio_seconds"] if snap else 0.0)
     text_events = st.session_state.spent_text_events + (snap["text_events"] if snap else 0)
-    audio_usd = audio_seconds / 60 * 0.08
-    text_usd = text_events * 0.004
+    # Dollars come from each call's own metered rate (audio_usd/text_usd),
+    # not from re-deriving cost off the summed seconds at one fixed rate -
+    # a session that mixes Think Fast 1.0 and 2.0 calls bills each at its
+    # own per-minute price.
+    audio_usd = st.session_state.spent_audio_usd + (snap["audio_usd"] if snap else 0.0)
+    text_usd = st.session_state.spent_text_usd + (snap["text_usd"] if snap else 0.0)
     cost_slot.markdown(render_cost_bar(audio_usd, text_usd), unsafe_allow_html=True)
 
     model_seen = (snap and snap["session_model"]) or st.session_state.last_model_seen
@@ -509,14 +557,24 @@ def paint(snap: dict | None):
 # the documented way to read values a media callback produced: the script
 # would otherwise finish and the page would freeze on the first frame.
 if call is not None and ctx is not None and ctx.state.playing:
-    while ctx.state.playing:
-        snap = call.snapshot()
-        paint(snap)
-        if snap["error"]:
-            st.error(snap["error"])
-            break
-        if not call.running:
-            break
-        time.sleep(0.4)
+    # Wrapped in try/finally so the call always gets torn down no matter how
+    # this loop exits: STOP (ctx.state.playing flips, which unwinds through
+    # here via Streamlit's rerun mechanism), an error, the worker thread
+    # dying on its own, or the browser tab disappearing out from under it.
+    # A bare `break` used to leave the socket open and the session counted
+    # against the team's concurrency cap until the process restarted.
+    try:
+        while ctx.state.playing:
+            snap = call.snapshot()
+            paint(snap)
+            if snap["error"]:
+                st.error(snap["error"])
+                break
+            if not call.running:
+                break
+            time.sleep(0.4)
+    finally:
+        if st.session_state.get("_call") is call:
+            _teardown_call(call, agent_voice)
 else:
     paint(None)
